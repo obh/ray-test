@@ -1,0 +1,41 @@
+name: github-user-enrichment
+dataset_path: "github_users.lance"
+primary_key: github_username
+workflow_version: 0.1.0
+
+sources: {}
+
+columns:
+  - name: github_username
+    type: string
+    source: raw
+
+  - name: name
+    type: string
+    source: raw
+
+  - name: repos
+    type: string
+    source: raw
+
+  - name: cleaned_name
+    type: string
+    processor: clean_name
+    derived_from: [name]
+    scaling:
+      parallelism: 10
+      num_cpus: 1
+
+  - name: linkedin_match
+    type: string
+    processor: match_linkedin_profile
+    derived_from: [cleaned_name]
+    lookup:
+      workflow: linkedin-person-enrichment
+      dataset_path: linkedin_profiles.lance
+      match_columns: [cleaned_name, member_id]
+
+execution_config:
+  convergence_mode: continuous
+  compaction_fragment_threshold: 20
+  heartbeat_timeout_seconds: 60

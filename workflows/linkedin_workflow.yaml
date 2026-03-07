@@ -1,0 +1,65 @@
+name: linkedin-person-enrichment
+dataset_path: "linkedin_profiles.lance"
+primary_key: member_id
+workflow_version: 0.1.0
+
+# Define how different streams land in the dataset
+sources:
+  stream_A:
+    topic: "linkedin-raw-scraper-1"
+    mapping:
+      full_name: name
+      raw_skills: skills
+
+  stream_B:
+    topic: "linkedin-bulk-purchased"
+    mapping:
+      display_name: name
+      expertise_list: skills
+
+# Define the Desired State of the Dataset
+columns:
+  # Base columns are ingested from the raw stream/batch
+  - name: member_id
+    type: string
+    source: raw
+
+  - name: name
+    type: string
+    source: raw
+
+  - name: skills
+    type: string
+    source: raw
+
+  # Derived columns are computed only if missing or stale
+  - name: cleaned_name
+    type: string
+    processor: clean_name
+    derived_from: [name]
+    scaling:
+      parallelism: 50
+      num_cpus: 1
+
+  - name: cleaned_skills
+    type: string
+    processor: clean_skills
+    derived_from: [skills]
+    scaling:
+      parallelism: 20
+      num_cpus: 1
+
+  - name: profile_embedding
+    type: vector
+    processor: mock_embedding
+    derived_from: [cleaned_name, cleaned_skills]
+    scaling:
+      batch_size: 100
+      parallelism: 10
+      num_cpus: 1
+
+# Execution Configuration
+execution_config:
+  convergence_mode: continuous
+  compaction_fragment_threshold: 20
+  heartbeat_timeout_seconds: 60

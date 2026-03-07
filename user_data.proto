@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+message Profile {
+  string member_id = 1;
+  string name = 2;
+  string skills = 3;
+}
+
+message ProfileBatch {
+  repeated Profile profiles = 1;
+}
+
+message GithubProfile {
+  string github_username = 1;
+  string name = 2;
+  string repos = 3;
+}
+
+message GithubProfileBatch {
+  repeated GithubProfile profiles = 1;
+}
