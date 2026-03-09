@@ -60,6 +60,19 @@ class WorkflowConfig:
 
     def derived_columns_in_order(self) -> list[ColumnDef]:
         """Topological sort of derived columns based on derived_from dependencies."""
+        levels = self.derived_columns_by_level()
+        return [col for level in levels for col in level]
+
+    def derived_columns_by_level(self) -> list[list[ColumnDef]]:
+        """
+        Group derived columns into levels for parallel execution.
+        Columns within the same level have no inter-dependencies and can run concurrently.
+        Level N+1 depends on level N being complete.
+
+        Example for linkedin workflow:
+          Level 0: [cleaned_name, cleaned_skills]   (independent, only depend on raw cols)
+          Level 1: [profile_embedding]              (depends on cleaned_name + cleaned_skills)
+        """
         col_map = {c.name: c for c in self.columns}
         derived = {c.name for c in self.derived_columns}
 
@@ -73,22 +86,28 @@ class WorkflowConfig:
                     dependents[dep].append(c.name)
                     in_degree[c.name] += 1
 
-        # Kahn's algorithm
+        # Level-aware Kahn's algorithm: process all zero-in-degree nodes
+        # as one level, then decrement and repeat
+        levels = []
         queue = [name for name in derived if in_degree[name] == 0]
-        result = []
+        visited = 0
         while queue:
-            node = queue.pop(0)
-            result.append(col_map[node])
-            for dependent in dependents[node]:
-                in_degree[dependent] -= 1
-                if in_degree[dependent] == 0:
-                    queue.append(dependent)
+            level = [col_map[name] for name in queue]
+            levels.append(level)
+            visited += len(queue)
+            next_queue = []
+            for node in queue:
+                for dependent in dependents[node]:
+                    in_degree[dependent] -= 1
+                    if in_degree[dependent] == 0:
+                        next_queue.append(dependent)
+            queue = next_queue
 
-        if len(result) != len(derived):
-            missing = derived - {c.name for c in result}
+        if visited != len(derived):
+            missing = derived - {c.name for c in col for col in levels}
             raise ValueError(f"Cycle detected in column dependencies: {missing}")
 
-        return result
+        return levels
 
 
 def workflow_dependency_order(configs: dict[str, WorkflowConfig]) -> list[str]:

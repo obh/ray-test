@@ -14,6 +14,8 @@ dependencies = [
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "httpx>=0.27.0",
+    "temporalio>=1.7.0",
+    "redis>=5.0.0",
 ]
 
 [build-system]

@@ -4,15 +4,19 @@ HTTP server exposing the convergence engine for multiple workflows.
 Endpoints:
   POST /ingest?workflow=<name>&count=500  — Generate and ingest random profiles
   POST /upsert?workflow=<name>&count=100&updates=50 — Ingest new + update existing
-  POST /converge?workflow=<name>          — Run convergence for one workflow
+  POST /converge?workflow=<name>          — Run convergence (direct or via Temporal)
   POST /converge-all                      — Converge all workflows in dependency order
   GET  /status?workflow=<name>            — Dataset stats (rows, fragments, columns)
   GET  /sample?workflow=<name>&n=5        — Sample rows from the dataset
   GET  /workflows                         — List available workflows
   POST /reset?workflow=<name>             — Delete a workflow's dataset
+
+Set USE_TEMPORAL=1 to route convergence through Temporal instead of in-process.
 """
+import os
 import random
 import shutil
+import uuid
 from pathlib import Path
 
 import ray
@@ -25,6 +29,23 @@ from starlette.responses import JSONResponse
 from config import parse_config, workflow_dependency_order, WorkflowConfig
 from convergence import ConvergenceEngine, ingest_raw_data, upsert_raw_data
 import user_data_pb2
+
+USE_TEMPORAL = os.environ.get("USE_TEMPORAL", "").lower() in ("1", "true", "yes")
+
+# Optional Redis lock manager for upsert safety
+LOCK_MANAGER = None
+REDIS_URL = os.environ.get("REDIS_URL", "")
+if REDIS_URL:
+    try:
+        from locks import RowLockManager
+        LOCK_MANAGER = RowLockManager(redis_url=REDIS_URL)
+        if LOCK_MANAGER.ping():
+            print(f"[INIT] Redis lock manager connected: {REDIS_URL}")
+        else:
+            LOCK_MANAGER = None
+            print("[INIT] Redis not reachable, running without locks")
+    except Exception as e:
+        print(f"[INIT] Redis unavailable ({e}), running without locks")
 
 WORKFLOWS_DIR = Path(__file__).parent / "workflows"
 
@@ -250,7 +271,11 @@ class ConvergenceServer:
 
         all_records = new_profiles + update_profiles
         random.shuffle(all_records)
-        frag_count = upsert_raw_data(config.dataset_path, all_records, primary_key=pk)
+        wf_lock_name = config.dataset_path.replace("/", "_").replace(".", "_")
+        frag_count = upsert_raw_data(
+            config.dataset_path, all_records, primary_key=pk,
+            lock_manager=LOCK_MANAGER, workflow_name=wf_lock_name,
+        )
 
         return JSONResponse({
             "action": "upsert",
@@ -267,6 +292,9 @@ class ConvergenceServer:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
         name, config, engine = wf
 
+        if USE_TEMPORAL:
+            return await self._converge_via_temporal(name, config)
+
         plan = engine.diff()
         result = engine.converge(plan)
 
@@ -274,28 +302,115 @@ class ConvergenceServer:
             "action": "converge",
             "workflow": name,
             "columns_computed": result.columns_computed,
+            "columns_failed": result.columns_failed,
             "rows_processed": result.rows_processed,
+            "passes": result.passes,
             "fragments_before": result.fragments_before,
             "fragments_after": result.fragments_after,
             "compaction_ran": result.compaction_ran,
             "duration_seconds": round(result.duration_seconds, 3),
         })
 
+    async def _converge_via_temporal(self, name: str, config: WorkflowConfig):
+        """Start a Temporal workflow for convergence and wait for result."""
+        from temporalio.client import Client
+        from temporal_workflow import ConvergeWorkflowInput, ConvergeWorkflow
+
+        temporal_url = os.environ.get("TEMPORAL_URL", "localhost:7233")
+        client = await Client.connect(temporal_url)
+
+        config_path = str(WORKFLOWS_DIR / f"{name.replace('-', '_')}_workflow.yaml")
+        # Fallback: search for matching config file
+        for yaml_file in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+            cfg = parse_config(yaml_file)
+            if cfg.name == name:
+                config_path = str(yaml_file)
+                break
+
+        workflow_id = f"converge-{name}-{uuid.uuid4().hex[:8]}"
+        result = await client.execute_workflow(
+            ConvergeWorkflow.run,
+            ConvergeWorkflowInput(
+                workflow_name=name,
+                config_path=config_path,
+                max_passes=config.execution_config.get("max_convergence_passes", 3),
+            ),
+            id=workflow_id,
+            task_queue="convergence-queue",
+        )
+
+        return JSONResponse({
+            "action": "converge",
+            "workflow": name,
+            "temporal_workflow_id": workflow_id,
+            "columns_computed": result.columns_computed,
+            "columns_failed": result.columns_failed,
+            "rows_processed": result.rows_processed,
+            "passes": result.passes,
+            "fragments_before": result.fragments_before,
+            "fragments_after": result.fragments_after,
+            "compaction_ran": result.compaction_ran,
+            "duration_seconds": result.duration_seconds,
+        })
+
     async def _converge_all(self, request: Request):
         order = workflow_dependency_order(CONFIGS)
         results = {}
-        for name in order:
-            engine = ENGINES[name]
-            plan = engine.diff()
-            result = engine.converge(plan)
-            results[name] = {
-                "columns_computed": result.columns_computed,
-                "rows_processed": result.rows_processed,
-                "fragments_before": result.fragments_before,
-                "fragments_after": result.fragments_after,
-                "compaction_ran": result.compaction_ran,
-                "duration_seconds": round(result.duration_seconds, 3),
-            }
+
+        if USE_TEMPORAL:
+            from temporalio.client import Client
+            from temporal_workflow import ConvergeWorkflowInput, ConvergeWorkflow
+
+            temporal_url = os.environ.get("TEMPORAL_URL", "localhost:7233")
+            client = await Client.connect(temporal_url)
+
+            for name in order:
+                config = CONFIGS[name]
+                config_path = str(WORKFLOWS_DIR / f"{name.replace('-', '_')}_workflow.yaml")
+                for yaml_file in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+                    cfg = parse_config(yaml_file)
+                    if cfg.name == name:
+                        config_path = str(yaml_file)
+                        break
+
+                workflow_id = f"converge-{name}-{uuid.uuid4().hex[:8]}"
+                result = await client.execute_workflow(
+                    ConvergeWorkflow.run,
+                    ConvergeWorkflowInput(
+                        workflow_name=name,
+                        config_path=config_path,
+                        max_passes=config.execution_config.get("max_convergence_passes", 3),
+                    ),
+                    id=workflow_id,
+                    task_queue="convergence-queue",
+                )
+                results[name] = {
+                    "temporal_workflow_id": workflow_id,
+                    "columns_computed": result.columns_computed,
+                    "columns_failed": result.columns_failed,
+                    "rows_processed": result.rows_processed,
+                    "passes": result.passes,
+                    "fragments_before": result.fragments_before,
+                    "fragments_after": result.fragments_after,
+                    "compaction_ran": result.compaction_ran,
+                    "duration_seconds": result.duration_seconds,
+                }
+        else:
+            for name in order:
+                engine = ENGINES[name]
+                plan = engine.diff()
+                result = engine.converge(plan)
+                results[name] = {
+                    "columns_computed": result.columns_computed,
+                    "columns_failed": result.columns_failed,
+                    "rows_processed": result.rows_processed,
+                    "passes": result.passes,
+                    "fragments_before": result.fragments_before,
+                    "fragments_after": result.fragments_after,
+                    "compaction_ran": result.compaction_ran,
+                    "duration_seconds": round(result.duration_seconds, 3),
+                }
+
         return JSONResponse({
             "action": "converge-all",
             "dependency_order": order,
