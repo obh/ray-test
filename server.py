@@ -12,15 +12,14 @@ Endpoints:
   POST /reset?workflow=<name>             — Delete a workflow's dataset
 
 Set USE_TEMPORAL=1 to route convergence through Temporal instead of in-process.
+Set STORAGE_BACKEND=postgres + DATABASE_URL to use Postgres instead of Lance.
 """
 import os
 import random
-import shutil
 import uuid
 from pathlib import Path
 
 import ray
-import lance
 import pyarrow as pa
 from ray import serve
 from starlette.requests import Request
@@ -28,6 +27,7 @@ from starlette.responses import JSONResponse
 
 from config import parse_config, workflow_dependency_order, WorkflowConfig
 from convergence import ConvergenceEngine, ingest_raw_data, upsert_raw_data
+from storage import StorageBackend, create_storage
 import user_data_pb2
 
 USE_TEMPORAL = os.environ.get("USE_TEMPORAL", "").lower() in ("1", "true", "yes")
@@ -49,22 +49,30 @@ if REDIS_URL:
 
 WORKFLOWS_DIR = Path(__file__).parent / "workflows"
 
-# Load all workflow configs
+# Load all workflow configs + create storage backends + engines
 CONFIGS: dict[str, WorkflowConfig] = {}
+STORAGES: dict[str, StorageBackend] = {}
 ENGINES: dict[str, ConvergenceEngine] = {}
 for yaml_file in sorted(WORKFLOWS_DIR.glob("*.yaml")):
     cfg = parse_config(yaml_file)
+    storage = create_storage(cfg)
     CONFIGS[cfg.name] = cfg
-    ENGINES[cfg.name] = ConvergenceEngine(cfg)
+    STORAGES[cfg.name] = storage
+    ENGINES[cfg.name] = ConvergenceEngine(cfg, storage)
 
 # Also support the legacy single-file config as fallback
 LEGACY_CONFIG_PATH = Path(__file__).parent / "workflow.yaml"
 if LEGACY_CONFIG_PATH.exists() and not CONFIGS:
     cfg = parse_config(LEGACY_CONFIG_PATH)
+    storage = create_storage(cfg)
     CONFIGS[cfg.name] = cfg
-    ENGINES[cfg.name] = ConvergenceEngine(cfg)
+    STORAGES[cfg.name] = storage
+    ENGINES[cfg.name] = ConvergenceEngine(cfg, storage)
 
 DEFAULT_WORKFLOW = next(iter(CONFIGS)) if CONFIGS else None
+
+STORAGE_BACKEND_NAME = os.environ.get("STORAGE_BACKEND", "lance")
+print(f"[INIT] Storage backend: {STORAGE_BACKEND_NAME}, workflows: {list(CONFIGS.keys())}")
 
 # --- Fake data generators ---
 
@@ -91,14 +99,15 @@ REPOS = [
 ]
 
 
-def _next_id_offset(config: WorkflowConfig) -> int:
+def _next_id_offset(config: WorkflowConfig, storage: StorageBackend) -> int:
     pk = config.primary_key
     try:
-        ds = lance.dataset(config.dataset_path)
-        ids = ds.to_table(columns=[pk]).column(pk).to_pylist()
+        if not storage.exists():
+            return 0
+        tbl = storage.read(columns=[pk])
+        ids = tbl.column(pk).to_pylist()
         if not ids:
             return 0
-        # Try to extract numeric suffix
         nums = []
         for mid in ids:
             parts = mid.rsplit("_", 1)
@@ -148,11 +157,11 @@ class ConvergenceServer:
     def __init__(self):
         pass
 
-    def _get_workflow(self, request: Request) -> tuple[str, WorkflowConfig, ConvergenceEngine] | None:
+    def _get_workflow(self, request: Request) -> tuple[str, WorkflowConfig, ConvergenceEngine, StorageBackend] | None:
         name = request.query_params.get("workflow", DEFAULT_WORKFLOW)
         if name not in CONFIGS:
             return None
-        return name, CONFIGS[name], ENGINES[name]
+        return name, CONFIGS[name], ENGINES[name], STORAGES[name]
 
     async def __call__(self, request: Request) -> JSONResponse:
         path = request.url.path
@@ -188,6 +197,7 @@ class ConvergenceServer:
                 "dataset_path": cfg.dataset_path,
                 "primary_key": cfg.primary_key,
                 "columns": [c.name for c in cfg.columns],
+                "storage_backend": STORAGE_BACKEND_NAME,
             })
         return JSONResponse({"workflows": workflows, "dependency_order": order})
 
@@ -195,7 +205,7 @@ class ConvergenceServer:
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
         content_type = request.headers.get("content-type", "")
 
@@ -217,14 +227,14 @@ class ConvergenceServer:
                 ]
         else:
             count = int(request.query_params.get("count", 500))
-            offset = _next_id_offset(config)
+            offset = _next_id_offset(config, storage)
             profiles = _generate_for_workflow(config, count, id_offset=offset)
 
         batch_size = 500
-        total_fragments = 0
+        total_frag = 0
         for i in range(0, len(profiles), batch_size):
             batch = profiles[i:i + batch_size]
-            total_fragments = ingest_raw_data(config.dataset_path, batch)
+            total_frag = ingest_raw_data(storage, batch)
 
         pk = config.primary_key
         first_id = profiles[0][pk] if profiles else ""
@@ -235,19 +245,19 @@ class ConvergenceServer:
             "workflow": name,
             "count": len(profiles),
             "id_range": [first_id, last_id],
-            "fragments": total_fragments,
+            "fragments": total_frag,
         })
 
     async def _upsert(self, request: Request):
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
         count = int(request.query_params.get("count", 100))
         updates = int(request.query_params.get("updates", 50))
 
-        offset = _next_id_offset(config)
+        offset = _next_id_offset(config, storage)
         new_profiles = _generate_for_workflow(config, count, id_offset=offset)
 
         update_profiles = []
@@ -273,7 +283,7 @@ class ConvergenceServer:
         random.shuffle(all_records)
         wf_lock_name = config.dataset_path.replace("/", "_").replace(".", "_")
         frag_count = upsert_raw_data(
-            config.dataset_path, all_records, primary_key=pk,
+            storage, all_records, primary_key=pk,
             lock_manager=LOCK_MANAGER, workflow_name=wf_lock_name,
         )
 
@@ -290,7 +300,7 @@ class ConvergenceServer:
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
         if USE_TEMPORAL:
             return await self._converge_via_temporal(name, config)
@@ -320,7 +330,6 @@ class ConvergenceServer:
         client = await Client.connect(temporal_url)
 
         config_path = str(WORKFLOWS_DIR / f"{name.replace('-', '_')}_workflow.yaml")
-        # Fallback: search for matching config file
         for yaml_file in sorted(WORKFLOWS_DIR.glob("*.yaml")):
             cfg = parse_config(yaml_file)
             if cfg.name == name:
@@ -421,16 +430,17 @@ class ConvergenceServer:
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
         try:
-            ds = lance.dataset(config.dataset_path)
+            stats = storage.stats()
             return JSONResponse({
                 "workflow": name,
-                "exists": True,
-                "rows": ds.count_rows(),
-                "fragments": len(ds.get_fragments()),
-                "columns": ds.schema.names,
+                "exists": stats.exists,
+                "rows": stats.row_count,
+                "fragments": stats.fragmentation,
+                "columns": stats.columns,
+                "storage_backend": STORAGE_BACKEND_NAME,
             })
         except Exception:
             return JSONResponse({"workflow": name, "exists": False, "rows": 0, "fragments": 0, "columns": []})
@@ -439,12 +449,12 @@ class ConvergenceServer:
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
         n = int(request.query_params.get("n", 5))
         try:
-            ds = lance.dataset(config.dataset_path)
-            table = ds.to_table().slice(0, n)
+            table = storage.read()
+            table = table.slice(0, n)
             rows = table.to_pylist()
             for row in rows:
                 for k, v in row.items():
@@ -458,11 +468,9 @@ class ConvergenceServer:
         wf = self._get_workflow(request)
         if not wf:
             return JSONResponse({"error": "Unknown workflow"}, status_code=400)
-        name, config, engine = wf
+        name, config, engine, storage = wf
 
-        path = Path(config.dataset_path)
-        if path.exists():
-            shutil.rmtree(path)
+        storage.drop()
         return JSONResponse({"action": "reset", "workflow": name, "message": "Dataset deleted"})
 
 

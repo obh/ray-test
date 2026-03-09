@@ -2,24 +2,26 @@
 Convergence Engine: the core of the Data State-First approach.
 
 Responsibilities:
-1. Diff: Compare desired schema (from YAML) against materialized data in Lance
-2. Plan: Identify which fragments are missing which derived columns ("dirty")
+1. Diff: Compare desired schema (from config) against materialized data in storage
+2. Plan: Identify which columns are missing or have NULLs ("dirty")
 3. Execute: Dispatch Ray tasks to compute missing columns, merge results back
 4. Retry: Failed column tasks are retried up to max_retries before giving up
 5. Re-converge: After a pass, re-diff to catch rows changed during execution
-6. Compact: Merge fragments when threshold is exceeded
+6. Compact: Run storage maintenance when fragmentation is high
+
+Storage-agnostic: works with any StorageBackend (Lance, Postgres, etc.)
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 
-import lance
 import pyarrow as pa
 import ray
 
 from config import WorkflowConfig, ColumnDef, LookupConfig
 from processors import REGISTRY
+from storage import StorageBackend, create_storage
 
 
 @dataclass
@@ -55,36 +57,20 @@ class ConvergenceResult:
 
 
 class ConvergenceEngine:
-    def __init__(self, config: WorkflowConfig):
+    def __init__(self, config: WorkflowConfig, storage: StorageBackend | None = None):
         self.config = config
-        self.dataset_path = config.dataset_path
-
-    def dataset_exists(self) -> bool:
-        try:
-            lance.dataset(self.dataset_path)
-            return True
-        except Exception:
-            return False
-
-    def _open_dataset(self) -> lance.LanceDataset:
-        return lance.dataset(self.dataset_path)
+        self.storage = storage or create_storage(config)
 
     def diff(self) -> ConvergencePlan:
         """
         Compare desired schema against materialized data.
         Returns a plan of what columns need to be computed.
         """
-        if not self.dataset_exists():
-            return ConvergencePlan(
-                tasks=[],
-                dirty_row_count=0,
-                fragment_count=0,
-            )
+        if not self.storage.exists():
+            return ConvergencePlan(tasks=[], dirty_row_count=0, fragment_count=0)
 
-        ds = self._open_dataset()
-        existing_columns = set(ds.schema.names)
-        row_count = ds.count_rows()
-        fragment_count = len(ds.get_fragments())
+        stats = self.storage.stats()
+        existing_columns = set(stats.columns)
 
         ordered_derived = self.config.derived_columns_in_order()
         tasks = []
@@ -92,9 +78,7 @@ class ConvergenceEngine:
             if col_def.name not in existing_columns:
                 tasks.append(ColumnTask(col_def=col_def, mode="add_new"))
             else:
-                # Column exists — check for NULL rows (stale/incomplete)
-                tbl = ds.to_table(columns=[col_def.name])
-                null_count = tbl.column(col_def.name).null_count
+                null_count = self.storage.null_count(col_def.name)
                 if null_count > 0:
                     tasks.append(ColumnTask(
                         col_def=col_def, mode="fill_nulls", null_count=null_count,
@@ -102,8 +86,8 @@ class ConvergenceEngine:
 
         return ConvergencePlan(
             tasks=tasks,
-            dirty_row_count=row_count,
-            fragment_count=fragment_count,
+            dirty_row_count=stats.row_count,
+            fragment_count=stats.fragmentation,
         )
 
     def converge(self, plan: ConvergencePlan | None = None) -> ConvergenceResult:
@@ -173,19 +157,17 @@ class ConvergenceEngine:
                 dirty_names = [t.col_def.name for t in plan.tasks]
                 print(f"  [PASS {pass_num}] Re-diffing, dirty: {dirty_names}")
 
-        # Compaction
-        if self.dataset_exists():
-            ds = self._open_dataset()
-            result.fragments_after = len(ds.get_fragments())
+        # Compaction / vacuum
+        if self.storage.exists():
+            stats = self.storage.stats()
+            result.fragments_after = stats.fragmentation
             threshold = self.config.execution_config.get("compaction_fragment_threshold", 20)
 
-            if result.fragments_after > threshold:
-                print(f"  [COMPACT] {result.fragments_after} fragments > threshold {threshold}")
-                ds.compact_files()
-                ds = self._open_dataset()
-                result.fragments_after = len(ds.get_fragments())
+            if self.storage.compact(threshold):
+                new_stats = self.storage.stats()
+                result.fragments_after = new_stats.fragmentation
                 result.compaction_ran = True
-                print(f"  [COMPACT] After compaction: {result.fragments_after} fragments")
+                print(f"  [COMPACT] {stats.fragmentation} -> {new_stats.fragmentation}")
 
         result.duration_seconds = time.time() - start
         return result
@@ -207,8 +189,7 @@ class ConvergenceEngine:
             if not level_tasks:
                 continue
 
-            ds = self._open_dataset()
-            existing_columns = set(ds.schema.names)
+            existing_columns = set(self.storage.get_columns())
 
             ready_tasks = []
             for task in level_tasks:
@@ -227,12 +208,12 @@ class ConvergenceEngine:
 
             if len(ready_tasks) == 1:
                 task = ready_tasks[0]
-                rows, ok = self._execute_task_with_retry(ds, task, max_retries)
+                rows, ok = self._execute_task_with_retry(task, max_retries)
                 (computed if ok else failed).append(task.col_def.name)
                 total_rows += rows
             else:
                 level_computed, level_failed, rows = self._execute_level_parallel(
-                    ds, ready_tasks, max_retries,
+                    ready_tasks, max_retries,
                 )
                 computed.extend(level_computed)
                 failed.extend(level_failed)
@@ -241,7 +222,7 @@ class ConvergenceEngine:
         return {"computed": computed, "failed": failed, "rows": total_rows}
 
     def _execute_task_with_retry(
-        self, ds: lance.LanceDataset, task: ColumnTask, max_retries: int,
+        self, task: ColumnTask, max_retries: int,
     ) -> tuple[int, bool]:
         """Execute a single column task with retries. Returns (rows_touched, success)."""
         col_def = task.col_def
@@ -253,25 +234,24 @@ class ConvergenceEngine:
                     print(f"    [{label}] {col_def.name} <- {col_def.derived_from} "
                           f"(processor={col_def.processor})"
                           f"{f' [retry {attempt-1}]' if attempt > 1 else ''}")
-                    rows = self._add_new_column(ds, col_def)
+                    rows = self._add_new_column(col_def)
                 else:
                     print(f"    [{label}] {col_def.name} <- {col_def.derived_from} "
                           f"({task.null_count} null rows, processor={col_def.processor})"
                           f"{f' [retry {attempt-1}]' if attempt > 1 else ''}")
-                    rows = self._fill_null_column(ds, col_def)
+                    rows = self._fill_null_column(col_def)
                 return rows, True
             except Exception as e:
                 print(f"    [ERROR] {col_def.name} attempt {attempt}: {e}")
                 if attempt <= max_retries:
-                    time.sleep(min(2 ** attempt, 10))  # exponential backoff, cap 10s
-                    ds = self._open_dataset()  # re-open in case state changed
+                    time.sleep(min(2 ** attempt, 10))
                 else:
                     print(f"    [FAILED] {col_def.name} after {max_retries + 1} attempts")
                     return 0, False
         return 0, False
 
     def _execute_level_parallel(
-        self, ds: lance.LanceDataset, tasks: list[ColumnTask], max_retries: int,
+        self, tasks: list[ColumnTask], max_retries: int,
     ) -> tuple[list[str], list[str], int]:
         """
         Compute multiple independent columns in parallel via Ray.
@@ -308,7 +288,7 @@ class ConvergenceEngine:
                 merge_table, mode, rows_touched = ray.get(ref)
                 total_rows += rows_touched
 
-                # Merge into Lance (sequential — Lance merge is not concurrent-safe)
+                # Merge back into storage (sequential — not concurrent-safe for most backends)
                 if merge_table is not None:
                     self._merge_result(task, merge_table, mode)
                     print(f"    [DONE] {col_def.name} ({rows_touched} rows)")
@@ -323,7 +303,6 @@ class ConvergenceEngine:
                     print(f"    [RETRY] {col_def.name} attempt {retries + 1}/{max_retries}: "
                           f"{e} (waiting {wait_secs}s)")
                     time.sleep(wait_secs)
-                    # Re-dispatch
                     new_ref = self._dispatch_column_task(task)
                     ref_to_task[new_ref] = task
                     pending.append(new_ref)
@@ -337,58 +316,49 @@ class ConvergenceEngine:
         """Submit a column computation as a Ray task. Returns an ObjectRef."""
         col_def = task.col_def
         pk = self.config.primary_key
+        # Ray remote tasks get a storage config dict to reconstruct the backend
+        storage_config = _storage_config_dict(self.storage)
         return _compute_column_remote.remote(
-            self.dataset_path, pk, col_def.name, col_def.processor,
+            storage_config, pk, col_def.name, col_def.processor,
             col_def.derived_from, col_def.lookup, task.mode,
         )
 
     def _merge_result(self, task: ColumnTask, merge_table: pa.Table, mode: str):
-        """Merge a computed column result back into the Lance dataset."""
+        """Merge a computed column result back into storage."""
         pk = self.config.primary_key
         col_def = task.col_def
 
         if mode == "add_new":
-            ds = self._open_dataset()
-            ds.merge(merge_table, left_on=pk, right_on=pk)
+            self.storage.merge_column(merge_table, pk, col_def.name)
         else:
-            # fill_nulls: delete old rows and append with filled values
+            # fill_nulls: update rows that had NULLs
             null_ids = merge_table.column(pk).to_pylist()
-            ds = self._open_dataset()
             id_list = ", ".join(f"'{mid}'" for mid in null_ids)
-            full_rows = ds.to_table(filter=f"{pk} IN ({id_list})")
+            full_rows = self.storage.read(filter_expr=f"{pk} IN ({id_list})")
             col_idx = full_rows.schema.get_field_index(col_def.name)
             full_rows = full_rows.set_column(
                 col_idx, col_def.name, merge_table.column(col_def.name),
             )
-            ds.delete(f"{pk} IN ({id_list})")
-            lance.write_dataset(full_rows, self.dataset_path, mode="append")
+            self.storage.replace_rows(f"{pk} IN ({id_list})", full_rows)
 
-    def _add_new_column(self, ds: lance.LanceDataset, col_def: ColumnDef) -> int:
-        """Add a column that doesn't exist yet. Uses Lance merge."""
+    def _add_new_column(self, col_def: ColumnDef) -> int:
+        """Add a column that doesn't exist yet."""
         pk = self.config.primary_key
         read_cols = [pk] + col_def.derived_from
-        input_table = ds.to_table(columns=read_cols)
+        input_table = self.storage.read(columns=read_cols)
         derived_array = self._compute_column(col_def, input_table)
         merge_table = pa.table({
             pk: input_table.column(pk),
             col_def.name: derived_array,
         })
-        ds.merge(merge_table, left_on=pk, right_on=pk)
+        self.storage.merge_column(merge_table, pk, col_def.name)
         return len(input_table)
 
-    def _fill_null_column(self, ds: lance.LanceDataset, col_def: ColumnDef) -> int:
-        """
-        Fill NULL values in an existing column.
-        Strategy: read rows where column is null, compute values,
-        then delete those rows and re-append with filled values.
-        """
+    def _fill_null_column(self, col_def: ColumnDef) -> int:
+        """Fill NULL values in an existing column."""
         pk = self.config.primary_key
-        all_cols = list(set([pk] + col_def.derived_from + [col_def.name]))
-        full_table = ds.to_table(columns=all_cols)
-
-        col_array = full_table.column(col_def.name)
-        null_mask = col_array.is_null()
-        null_table = full_table.filter(null_mask)
+        extra_cols = [pk] + col_def.derived_from
+        null_table = self.storage.read_null_rows(col_def.name, extra_cols)
         if len(null_table) == 0:
             return 0
 
@@ -398,16 +368,13 @@ class ConvergenceEngine:
         input_cols_table = null_table.select([pk] + col_def.derived_from)
         derived_array = self._compute_column(col_def, input_cols_table)
 
-        ds_reopen = self._open_dataset()
+        # Read full rows, update the column, replace
         id_list = ", ".join(f"'{mid}'" for mid in null_ids)
-        full_rows = ds_reopen.to_table(filter=f"{pk} IN ({id_list})")
-
+        full_rows = self.storage.read(filter_expr=f"{pk} IN ({id_list})")
         col_idx = full_rows.schema.get_field_index(col_def.name)
         full_rows = full_rows.set_column(col_idx, col_def.name, derived_array)
 
-        ds_reopen.delete(f"{pk} IN ({id_list})")
-        lance.write_dataset(full_rows, self.dataset_path, mode="append")
-
+        self.storage.replace_rows(f"{pk} IN ({id_list})", full_rows)
         return len(null_ids)
 
     def _compute_column(self, col_def: ColumnDef, input_table: pa.Table) -> pa.Array:
@@ -471,36 +438,57 @@ class ConvergenceEngine:
         return combined
 
 
+# --- Helper for serializing storage config to Ray tasks ---
+
+def _storage_config_dict(storage: StorageBackend) -> dict:
+    """Serialize storage backend info so Ray tasks can reconstruct it."""
+    from storage import LanceStorage, PostgresStorage
+    if isinstance(storage, LanceStorage):
+        return {"backend": "lance", "dataset_path": storage.dataset_path}
+    elif isinstance(storage, PostgresStorage):
+        return {"backend": "postgres", "connection_string": storage.connection_string, "table_name": storage.table_name}
+    else:
+        raise ValueError(f"Unknown storage backend: {type(storage)}")
+
+
+def _reconstruct_storage(config: dict) -> StorageBackend:
+    """Reconstruct a StorageBackend from serialized config dict."""
+    from storage import LanceStorage, PostgresStorage
+    if config["backend"] == "lance":
+        return LanceStorage(config["dataset_path"])
+    elif config["backend"] == "postgres":
+        return PostgresStorage(config["connection_string"], config["table_name"])
+    else:
+        raise ValueError(f"Unknown backend: {config['backend']}")
+
+
 # --- Ray remote function for level-parallel column computation ---
 
 @ray.remote
-def _compute_column_remote(dataset_path, primary_key, col_name, col_processor,
+def _compute_column_remote(storage_config, primary_key, col_name, col_processor,
                             derived_from, lookup_config, mode):
     """
     Standalone Ray task that computes a single column.
     Defined at module level so Ray can serialize it once (not per-call).
+    Reconstructs storage backend from config dict.
     """
-    import lance as _lance
     import pyarrow as _pa
     from processors import REGISTRY as reg
 
-    ds = _lance.dataset(dataset_path)
+    storage = _reconstruct_storage(storage_config)
     fn = reg[col_processor]
 
     if mode == "add_new":
         read_cols = [primary_key] + derived_from
-        input_table = ds.to_table(columns=read_cols)
+        input_table = storage.read(columns=read_cols)
         derived_array = fn(input_table, derived_from, lookup=lookup_config)
         return _pa.table({
             primary_key: input_table.column(primary_key),
             col_name: derived_array,
         }), mode, len(input_table)
     else:  # fill_nulls
-        all_cols = list(set([primary_key] + derived_from + [col_name]))
-        full_table = ds.to_table(columns=all_cols)
-        col_array = full_table.column(col_name)
-        null_mask = col_array.is_null()
-        null_table = full_table.filter(null_mask)
+        extra_cols = [primary_key] + derived_from
+        null_table = storage.read_null_rows(col_name, extra_cols)
         if len(null_table) == 0:
             return None, mode, 0
         input_cols_table = null_table.select([primary_key] + derived_from)
@@ -511,93 +499,47 @@ def _compute_column_remote(dataset_path, primary_key, col_name, col_processor,
         }), mode, len(null_table)
 
 
-# --- Data ingestion functions ---
+# --- Storage-agnostic data ingestion functions ---
 
 def ingest_raw_data(
-    dataset_path: str,
+    storage: StorageBackend,
     records: list[dict],
-    mode: str = "append",
 ) -> int:
     """
-    Write raw records to the Lance dataset.
-    Handles the buffering concern: callers should batch before calling this.
-    Returns fragment count after write.
+    Write raw records to storage.
+    Returns fragmentation metric after write.
     """
     table = pa.Table.from_pylist(records)
-
-    try:
-        lance.dataset(dataset_path)
-        exists = True
-    except Exception:
-        exists = False
-
-    if not exists or mode == "overwrite":
-        lance.write_dataset(table, dataset_path, mode="overwrite")
-    else:
-        lance.write_dataset(table, dataset_path, mode="append")
-
-    ds = lance.dataset(dataset_path)
-    return len(ds.get_fragments())
+    storage.append(table)
+    return storage.stats().fragmentation
 
 
 def upsert_raw_data(
-    dataset_path: str,
+    storage: StorageBackend,
     records: list[dict],
     primary_key: str = "member_id",
     lock_manager=None,
     workflow_name: str | None = None,
 ) -> int:
     """
-    Upsert records: new primary keys are appended, existing ones are updated
-    using deletion vectors + append.
+    Upsert records by primary key.
 
     If lock_manager is provided, checks for locked rows and skips them
     to avoid overwriting data being converged.
 
-    Returns fragment count after write.
+    Returns fragmentation metric after write.
     """
-    new_table = pa.Table.from_pylist(records)
-    new_ids = set(new_table.column(primary_key).to_pylist())
+    table = pa.Table.from_pylist(records)
 
-    try:
-        ds = lance.dataset(dataset_path)
-    except Exception:
-        lance.write_dataset(new_table, dataset_path, mode="overwrite")
-        return 1
-
-    existing_table = ds.to_table(columns=[primary_key])
-    existing_ids = set(existing_table.column(primary_key).to_pylist())
-    overlap_ids = new_ids & existing_ids
-
-    # Check Redis locks — skip rows currently being converged
-    if overlap_ids and lock_manager and workflow_name:
-        locked = lock_manager.check_locked(workflow_name, list(overlap_ids))
+    if lock_manager and workflow_name and storage.exists():
+        new_ids = set(table.column(primary_key).to_pylist())
+        locked = lock_manager.check_locked(workflow_name, list(new_ids))
         if locked:
             locked_set = set(locked)
             print(f"  [UPSERT] Skipping {len(locked)} locked rows (being converged)")
-            overlap_ids = overlap_ids - locked_set
-            # Also remove locked rows from new_table
-            all_new_ids = new_table.column(primary_key).to_pylist()
-            keep_mask = pa.array([rid not in locked_set for rid in all_new_ids])
-            new_table = new_table.filter(keep_mask)
+            all_ids = table.column(primary_key).to_pylist()
+            keep_mask = pa.array([rid not in locked_set for rid in all_ids])
+            table = table.filter(keep_mask)
 
-    if overlap_ids:
-        id_list = ", ".join(f"'{mid}'" for mid in overlap_ids)
-        ds.delete(f"{primary_key} IN ({id_list})")
-        print(f"  [UPSERT] Deleted {len(overlap_ids)} existing rows (deletion vectors)")
-
-    existing_schema_names = set(ds.schema.names)
-    new_schema_names = set(new_table.schema.names)
-
-    for col_name in existing_schema_names - new_schema_names:
-        col_type = ds.schema.field(col_name).type
-        null_array = pa.nulls(len(new_table), type=col_type)
-        new_table = new_table.append_column(col_name, null_array)
-
-    cols_to_write = [c for c in ds.schema.names if c in new_table.schema.names]
-    new_table = new_table.select(cols_to_write)
-
-    lance.write_dataset(new_table, dataset_path, mode="append")
-    ds = lance.dataset(dataset_path)
-    print(f"  [UPSERT] Appended {len(new_table)} rows. Fragments: {len(ds.get_fragments())}")
-    return len(ds.get_fragments())
+    storage.upsert(table, primary_key)
+    return storage.stats().fragmentation

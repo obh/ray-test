@@ -34,6 +34,23 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: convergence_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=convergence
+      - POSTGRES_USER=convergence
+      - POSTGRES_PASSWORD=convergence
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U convergence"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # --- Application ---
   convergence-server:
     build: .
@@ -55,8 +72,12 @@ services:
       - REDIS_URL=redis://redis:6379
       - TEMPORAL_URL=temporal:7233
       - USE_TEMPORAL=${USE_TEMPORAL:-false}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-lance}
+      - DATABASE_URL=postgresql://convergence:convergence@postgres:5432/convergence
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   temporal-worker:
@@ -67,6 +88,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - TEMPORAL_URL=temporal:7233
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-lance}
+      - DATABASE_URL=postgresql://convergence:convergence@postgres:5432/convergence
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_REGION=${AWS_REGION:-us-east-2}
@@ -77,3 +100,6 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
+
+volumes:
+  pgdata:
